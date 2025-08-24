@@ -1,0 +1,14 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+accelerate
+datasets
+huggingface_hub
+iree-base-compiler[onnx]
+iree-base-runtime
+numpy
+onnx
+onnxruntime
+onnx_graphsurgeon
+optimum[onnxruntime]
+tokenizers
+torch
+transformers

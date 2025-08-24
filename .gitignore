@@ -1,0 +1,12 @@
+*.onnx
+*.tflite
+*.vmfb
+*.mlir
+models/
+!*/models/
+.venv/
+venv/
+stats/
+__pycache__/
+*.py[cod]
+temp*/
