@@ -58,7 +58,7 @@ class MoonshineModelExporter:
         max_tok_per_s: int = 6,
         models_dir: str | os.PathLike = "models/onnx",
         show_model_info: bool = False,
-        skip_optimum: bool = False,
+        use_optimum: bool = False,
     ):
         if model_size not in ["base", "tiny"]:
             raise ValueError(
@@ -78,7 +78,7 @@ class MoonshineModelExporter:
             floor(floor(floor(self._num_samples / 64 - 127 / 64) / 3) / 2) - 1
         )
 
-        if not skip_optimum:
+        if use_optimum or self._model_dtype in OPTIMUM_DTYPES:
             self._model_dtype = "fp32" if self._model_dtype == "float" else self._model_dtype
             if self._model_dtype not in OPTIMUM_DTYPES:
                 raise ValueError(f"'{self._model_dtype}' is an invalid dtype for optimium export, choose one of {OPTIMUM_DTYPES}")
@@ -544,7 +544,7 @@ class MoonshineModelExporter:
         for comp, export_path in self._export_paths.items():
             print(f"[IREE-export] Exporting {comp} model @ '{export_path}' to IREE...")
             self.check_model(onnx.load(export_path), skip_data_prop="decoder" in comp and self._merged_decoder)
-            iree_model_path = Path(iree_dir) / "moonshine" / self._model_size / self._model_dtype
+            iree_model_path = Path(iree_dir) / "moonshine" / self._model_size / self._model_dtype / ("static" if self._static_models else "dynamic")
             export_iree(
                 export_path,
                 iree_model_path
@@ -588,10 +588,10 @@ if __name__ == "__main__":
         help="Export dynamic models for CPU"
     )
     parser.add_argument(
-        "--skip-optimum",
+        "--use-optimum",
         action="store_true",
         default=False,
-        help="Use pre-exported ONNX models instead of exporting with optimum-cli"
+        help="Use optimum-cli to generate ONNX models rather than loading prebuilt ones"
     )
     parser.add_argument(
         "--skip-iree",
@@ -609,7 +609,7 @@ if __name__ == "__main__":
         max_tok_per_s=args.tokens_per_sec,
         models_dir=args.onnx_dir,
         show_model_info=args.show_model_info,
-        skip_optimum=args.skip_optimum
+        use_optimum=args.use_optimum
     )
     exporter.export_onnx()
     if not args.skip_iree:
