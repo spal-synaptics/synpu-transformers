@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 from abc import ABC, abstractmethod
@@ -21,6 +22,7 @@ class MoonshineBase(ABC):
         model_size: Literal["base", "tiny"],
         max_inp_len: int | None
     ):
+        self._logger = logging.getLogger(self.__class__.__name__)
         self._model_size = model_size
         self._max_inp_len = max_inp_len
 
@@ -67,10 +69,10 @@ class MoonshineBase(ABC):
     def _size_input(self, input: np.ndarray) -> np.ndarray:
         input = input.flatten()
         if len(input) > self._max_inp_len:
-            # print(f"Truncating input from {len(input)} to {self.max_inp_len}")
+            self._logger.warning("Truncating input from %d to %d", len(input), self.max_inp_len)
             input = input[: self._max_inp_len]
         elif len(input) < self._max_inp_len:
-            # print(f"Padding input from {len(input)} to {self.max_inp_len}")
+            self._logger.info("Padding input from %d to %d", len(input), self.max_inp_len)
             input = np.pad(
                 input,
                 (0, self._max_inp_len - len(input)),
@@ -94,7 +96,9 @@ class MoonshineDynamic(MoonshineBase):
         super().__init__(model_size, max_inp_len)
 
         self._encoder = encoder
+        self._logger.info("Loaded encoder '%s'", str(self._encoder.model_path))
         self._decoder = decoder
+        self._logger.info("Loaded merged decoder '%s'", str(self._decoder.model_path))
 
     @classmethod
     def from_onnx(
@@ -188,9 +192,11 @@ class MoonshineStatic(MoonshineBase):
         super().__init__(model_size, max_inp_len)
 
         self._encoder = encoder
+        self._logger.info("Loaded encoder '%s'", str(self._encoder.model_path))
         self._decoder = decoder
+        self._logger.info("Loaded decoder '%s'", str(self._decoder.model_path))
         self._decoder_with_past = decoder_with_past
-        self._model_size = model_size
+        self._logger.info("Loaded decoder with past '%s'", str(self._decoder_with_past.model_path))
         self._max_dec_len = max_dec_len
         self._dec_cache_shapes: dict[str, tuple[int]] = {
             cache_name: (1, self._n_kv_heads, self._max_dec_len, self._head_dim)
