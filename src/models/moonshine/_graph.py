@@ -1,10 +1,129 @@
+import logging
+from functools import wraps, WRAPPER_ASSIGNMENTS
+from typing import ParamSpec, Callable, Concatenate
+
 import onnx
 import onnx_graphsurgeon as gs
 import numpy as np
 
 
+logger = logging.getLogger("MoonshineGraphEditor")
+P = ParamSpec("P")
+ASSIGNED = tuple(x for x in WRAPPER_ASSIGNMENTS if x != "__annotations__")
+
+def graph_edit(edit_fn: Callable[Concatenate[gs.Graph, gs.Node, P], object]):
+    @wraps(edit_fn, assigned=ASSIGNED)
+    def run(component: str, graph: gs.Graph, **kwargs: P.kwargs) -> gs.Graph:
+        for node in list(graph.nodes):
+            edit_fn(component, graph, node, **kwargs)
+        return graph.cleanup(
+            remove_unused_graph_inputs=True,
+            remove_unused_node_outputs=True
+        ).toposort()
+    return run
+
+
+@graph_edit
+def remove_isNaN(
+    component: str,
+    graph: gs.Graph,
+    node: gs.Node
+):
+    if node.op == "IsNaN":
+        graph.remove_unsupported_isNaN(node)
+        logger.info("[%s] Removed unsupported IsNaN op '%s'", component, node.name)
+
+
+@graph_edit
+def move_output_from_concat(
+    component: str,
+    graph: gs.Graph,
+    node: gs.Node,
+    *,
+    output_names: list[str],
+    pad_len: str
+):
+    if node.op == "Concat" and node.outputs[0].name in output_names:
+        output_name = node.outputs[0].name
+        consumers: list[gs.Node] = list(node.outputs[0].outputs)
+        for consumer in consumers:
+            if consumer.op == "Pad":
+                graph.move_output_from_concat_to_slice(node, consumer, pad_len)
+                logger.info("[%s] Moved output '%s' to Pad node '%s'", component, output_name, consumer.name)
+
+
+@graph_edit
+def replace_dynamic_kv_cache(
+    component: str,
+    graph: gs.Graph,
+    node: gs.Node,
+    *,
+    output_names: list[str],
+    cur_len: gs.Variable,
+    max_tokens: int
+):
+    if node.op == "Concat" and node.outputs[0].name in output_names:
+        cache_output = node.outputs[0].name
+        if node.attrs["axis"] != -2:
+            raise ValueError(
+                f"Static KV Cache: '{node.name}' expected Concat axis to be -2, got {node.attrs['axis']}"
+            )
+        if len(node.inputs) != 2:
+            raise ValueError(
+                f"Static KV Cache: '{node.name}' expected Concat node to have 2 inputs, got {len(node.inputs)}"
+            )
+        graph.replace_kv_concat_with_mask(node, cur_len, max_tokens)
+        logger.info("[%s] Added static KV cache for output '%s'", component, cache_output)
+
+
+@graph_edit
+def mask_future_attn_scores(
+    component: str,
+    graph: gs.Graph,
+    node: gs.Node,
+    *,
+    cur_len: gs.Variable,
+    max_tokens: int
+):
+    if node.op == "Softmax" and node.name.endswith("self_attn/Softmax"):
+        if (prod := node.i()).op != "Add":
+            raise ValueError(
+                f"Causal Attention Mask: '{node.name}' expected producer to be Add node, got {prod.op} ({prod.name})"
+            )
+        graph.add_causal_attn_score_mask(prod, cur_len, max_tokens)
+        logger.info("[%s] Added causal attention mask to scores at node '%s'", component, node.name)
+
+
+@graph_edit
+def add_curr_len_input(
+    component: str,
+    graph: gs.Graph,
+    node: gs.Node,
+    *,
+    cur_len: gs.Variable
+):
+    if node.op == "Shape" and "past_key_values" in node.inputs[0].name:
+        graph.replace_dynamic_seq_len_getter(node, cur_len)
+        logger.info("[%s] Replaced dynamic seq len getter at node '%s'", component, node.name)
+
+
+@graph_edit
+def convert_to_static_index(
+    component: str,
+    graph: gs.Graph,
+    node: gs.Node
+):
+    if (
+        node.op == "Range"
+        and node.i(1).op == "Add"
+        and any(inp is node.inputs[0] for inp in node.i(1).inputs)
+    ):
+        graph.replace_dynamic_range_index(node)
+        logger.info("[%s] Replaced dynamic range index for node '%s'", component, node.name)
+
+
 @gs.Graph.register()
-def remove_is_NaN(self: gs.Graph, is_nan_node: gs.Node) -> None:
+def remove_unsupported_isNaN(self: gs.Graph, is_nan_node: gs.Node) -> None:
     """
     Remove unsupported `IsNaN -> Where` operation.
 

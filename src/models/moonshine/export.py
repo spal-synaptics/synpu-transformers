@@ -105,12 +105,12 @@ class MoonshineModelExporter:
             / "export"
             / self._model_size
             / self._model_dtype
+            / ("static" if self._static_models else "dynamic")
         )
         self._export_dir.mkdir(parents=True, exist_ok=True)
         self._export_paths: dict[str, Path] = {}
 
-    @staticmethod
-    def check_model(model: onnx.ModelProto, skip_data_prop: bool = False) -> onnx.ModelProto:
+    def check_model(self, model: onnx.ModelProto, skip_data_prop: bool = False) -> onnx.ModelProto:
         if model.ir_version > 10:
             self._logger.warning(
                 "Warning: Model IR version is > 10 (%d), which might be unsupported by onnxruntime",
@@ -191,8 +191,6 @@ class MoonshineModelExporter:
                     f"Failed to export ONNX model via '{' '.join(e.cmd)}':\n    "
                     + "\n    ".join(e.output.strip().splitlines())
                 ) from None
-            for comp, comp_model_name in MoonshineModelExporter.COMPONENTS.items():
-                self.optimize_model(self._onnx_dir / comp_model_name, comp)
 
     def _hf_download_models(self):
         for comp_model_name in MoonshineModelExporter.COMPONENTS_MERGED.values():
@@ -323,33 +321,20 @@ class MoonshineModelExporter:
                     raise ValueError(
                         f"Unexpected dynamic dimension '{d}' in tensor '{tensor.name}'"
                     )
-            print(
-                f"[{comp}] Fixing IO dims '{tensor.name}': {old_shape} -> {tensor.shape}"
+            self._logger.info(
+                "(%s) Fixing IO dims '%s': %s -> %s",
+                comp,
+                tensor.name,
+                str(old_shape),
+                str(tensor.shape)
             )
 
-        for node in graph.nodes:
+        # Remove isNaN ops
+        graph = remove_isNaN(comp, graph)
+        # Move model output if it's fed by a Concat node which has a Pad consumer
+        if not with_past:
+            graph = move_output_from_concat(comp, graph, output_names=output_names, pad_len=pad_len)
 
-            # Remove or replace isNaN ops
-            if node.op == "IsNaN":
-                graph.remove_is_NaN(node)
-                print(f"[{comp}] Removed unsupported IsNaN op '{node.name}'")
-
-            # Move model output if it's fed by a Concat node which has a Pad consumer
-            if (
-                not with_past
-                and node.op == "Concat"
-                and node.outputs[0].name in output_names
-            ):
-                output_name = node.outputs[0].name
-                consumers: list[gs.Node] = list(node.outputs[0].outputs)
-                for consumer in consumers:
-                    if consumer.op == "Pad":
-                        graph.move_output_from_concat_to_slice(node, consumer, pad_len)
-                        print(
-                            f"[{comp}] Moved output '{output_name}' to Pad node '{consumer.name}'"
-                        )
-
-        # TODO: Add Cast nodes before activation ops
         if with_past:
             cur_len_2d = gs.Variable("current_len", dtype=np.int64, shape=[1, 1])
             graph.inputs.append(cur_len_2d)
@@ -357,57 +342,17 @@ class MoonshineModelExporter:
                 name="current_len_to_1d",
                 op="Squeeze",
                 inputs=[cur_len_2d, [0]],
-                outputs=[
-                    gs.Variable(
-                        cur_len_2d.name + "_squeezed", dtype=np.int64, shape=[1]
-                    )
-                ],
+                outputs=[gs.Variable(cur_len_2d.name + "_squeezed", dtype=np.int64, shape=[1])],
             )[0]
 
-            for node in graph.nodes:
-
-                # Replace dynamic KV cache update
-                if node.op == "Concat" and node.outputs[0].name in output_names:
-                    cache_output = node.outputs[0].name
-                    if node.attrs["axis"] != -2:
-                        raise ValueError(
-                            f"Static KV Cache: '{node.name}' expected Concat axis to be -2, got {node.attrs['axis']}"
-                        )
-                    if len(node.inputs) != 2:
-                        raise ValueError(
-                            f"Static KV Cache: '{node.name}' expected Concat node to have 2 inputs, got {len(node.inputs)}"
-                        )
-                    graph.replace_kv_concat_with_mask(node, cur_len, self._max_tokens)
-                    print(f"[{comp}] Added static KV cache for output '{cache_output}'")
-
-                # Add causal attention score mask
-                if node.op == "Softmax" and node.name.endswith("self_attn/Softmax"):
-                    if (prod := node.i()).op != "Add":
-                        raise ValueError(
-                            f"Causal Attention Mask: '{node.name}' expected producer to be Add node, got {prod.op} ({prod.name})"
-                        )
-                    graph.add_causal_attn_score_mask(prod, cur_len, self._max_tokens)
-                    print(
-                        f"[{comp}] Added causal attention mask to scores at node '{node.name}'"
-                    )
-
-                # Replace dynamic sequence length getter with `cur_len`
-                if node.op == "Shape" and "past_key_values" in node.inputs[0].name:
-                    graph.replace_dynamic_seq_len_getter(node, cur_len)
-                    print(
-                        f"[{comp}] Replaced dynamic seq len getter at node '{node.name}'"
-                    )
-
-                # Replace dynamic index computation `Range(start, start + 1, 1) -> index`
-                if (
-                    node.op == "Range"
-                    and node.i(1).op == "Add"
-                    and any(inp is node.inputs[0] for inp in node.i(1).inputs)
-                ):
-                    graph.replace_dynamic_range_index(node)
-                    print(
-                        f"[{comp}] Replaced dynamic range index for node '{node.name}'"
-                    )
+            # Replace dynamic KV cache
+            graph = replace_dynamic_kv_cache(comp, graph, cur_len=cur_len, output_names=output_names, max_tokens=self._max_tokens)
+            # Add causal attention score mask
+            graph = mask_future_attn_scores(comp, graph, cur_len=cur_len, max_tokens=self._max_tokens)
+            # Replace dynamic sequence length getter with `cur_len`
+            graph = add_curr_len_input(comp, graph, cur_len=cur_len)
+            # Replace dynamic index computation `Range(start, start + 1, 1) -> index`
+            graph = convert_to_static_index(comp, graph)
 
         graph = graph.cleanup(
             remove_unused_graph_inputs=True, remove_unused_node_outputs=True
