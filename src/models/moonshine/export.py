@@ -206,9 +206,9 @@ class MoonshineModelExporter:
         merged_model_names: set[str] = set(self.COMPONENTS_MERGED.values())
         model_names: set[str] = set(list(p.name for p in self._onnx_dir.glob("*.onnx")))
         if model_names == (merged_model_names | unmerged_model_names):
-            self._logger.warning("(ONNX-load) Found both merged and un-merged decoder models @ '%s', defaulting to loading un-merged", str(self._onnx_dir))
-            model_names = unmerged_model_names
-            merged_decoder = False
+            self._logger.warning("(ONNX-load) Found both merged and un-merged decoder models @ '%s', defaulting to loading merged", str(self._onnx_dir))
+            model_names = merged_model_names
+            merged_decoder = True
         elif model_names == unmerged_model_names:
             self._logger.info("(ONNX-load) Found encoder and un-merged decoder models @ '%s'", str(self._onnx_dir))
             merged_decoder = False
