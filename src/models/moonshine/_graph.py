@@ -29,6 +29,14 @@ def remove_isNaN(
     graph: gs.Graph,
     node: gs.Node
 ):
+    """
+    Remove IsNaN operations that are not supported by the target platform.
+    
+    Args:
+        component (str): Component name for logging
+        graph (gs.Graph): ONNX graph
+        node (gs.Node): Node to potentially remove
+    """
     if node.op == "IsNaN":
         graph.remove_unsupported_isNaN(node)
         logger.info("[%s] Removed unsupported IsNaN op '%s'", component, node.name)
@@ -43,6 +51,16 @@ def move_output_from_concat(
     output_names: list[str],
     pad_len: str
 ):
+    """
+    Move outputs from Concat nodes to their consumer Pad nodes for compatibility.
+
+    Args:
+        component (str): Component name for logging
+        graph (gs.Graph): ONNX graph
+        node (gs.Node): Node to potentially modify
+        output_names (list[str]): List of output names to process
+        pad_len (str): Length of padding to apply
+    """
     if node.op == "Concat" and node.outputs[0].name in output_names:
         output_name = node.outputs[0].name
         consumers: list[gs.Node] = list(node.outputs[0].outputs)
@@ -62,6 +80,17 @@ def replace_dynamic_kv_cache(
     cur_len: gs.Variable,
     max_tokens: int
 ):
+    """
+    Replace dynamic key-value cache updates with static in-place operations.
+
+    Args:
+        component (str): Component name for logging
+        graph (gs.Graph): ONNX graph
+        node (gs.Node): Node to potentially modify
+        output_names (list[str]): List of cache output names to process
+        cur_len (gs.Variable): Current sequence length input
+        max_tokens (int): Maximum number of tokens in sequence
+    """
     if node.op == "Concat" and node.outputs[0].name in output_names:
         cache_output = node.outputs[0].name
         if node.attrs["axis"] != -2:
@@ -85,6 +114,16 @@ def mask_future_attn_scores(
     cur_len: gs.Variable,
     max_tokens: int
 ):
+    """
+    Add causal masking to attention scores to prevent attending to future tokens.
+
+    Args:
+        component (str): Component name for logging
+        graph (gs.Graph): ONNX graph
+        node (gs.Node): Node to potentially modify
+        cur_len (gs.Variable): Current sequence length input
+        max_tokens (int): Maximum number of tokens in sequence
+    """
     if node.op == "Softmax" and node.name.endswith("self_attn/Softmax"):
         if (prod := node.i()).op != "Add":
             raise ValueError(
@@ -102,6 +141,15 @@ def add_curr_len_input(
     *,
     cur_len: gs.Variable
 ):
+    """
+    Replace dynamic sequence length computation with runtime model input.
+
+    Args:
+        component (str): Component name for logging
+        graph (gs.Graph): ONNX graph
+        node (gs.Node): Node to potentially modify
+        cur_len (gs.Variable): Current sequence length input
+    """
     if node.op == "Shape" and "past_key_values" in node.inputs[0].name:
         graph.replace_dynamic_seq_len_getter(node, cur_len)
         logger.info("[%s] Replaced dynamic seq len getter at node '%s'", component, node.name)
@@ -113,6 +161,14 @@ def convert_to_static_index(
     graph: gs.Graph,
     node: gs.Node
 ):
+    """
+    Convert dynamic Range-based indexing to static indexing if `index = Range(start, start + 1, 1)`.
+
+    Args:
+        component (str): Component name for logging
+        graph (gs.Graph): ONNX graph
+        node (gs.Node): Node to potentially modify
+    """
     if (
         node.op == "Range"
         and node.i(1).op == "Add"
