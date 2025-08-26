@@ -363,6 +363,29 @@ class MoonshineModelExporter:
         new_model.ir_version = decoder_model.ir_version
         return new_model
 
+    def _patch_projections_dequantize(self):
+        if self._model_dtype in ("float", "fp32"):
+            return
+
+        # Manually dequantize projection scores
+        for comp, model in self._components.items():
+            if "decoder" not in comp:
+                continue
+            graph = gs.import_onnx(model)
+            graph = dequantize_proj_matmul(
+                comp, graph,
+                hidden_size=int(self._config.hidden_size),
+                vocab_size=int(self._config.vocab_size)
+            )
+            graph = graph.cleanup(
+                remove_unused_graph_inputs=True, remove_unused_node_outputs=True
+            ).toposort()
+            new_model = onnx.shape_inference.infer_shapes(
+                gs.export_onnx(graph), check_type=True, strict_mode=True, data_prop=False
+            )
+            new_model.ir_version = model.ir_version
+            self._components[comp] = new_model
+
     def make_static(
         self,
         *,
@@ -412,6 +435,7 @@ class MoonshineModelExporter:
     def export_onnx(self, validate: bool = True):
         if self._static_models:
             self.make_static()
+        self._patch_projections_dequantize()
 
         for comp, model in self._components.items():
             self._export_paths[comp] = self._export_dir / f"{comp}.onnx"
