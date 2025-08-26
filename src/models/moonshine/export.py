@@ -25,7 +25,7 @@ from . import (
 )
 from ._graph import *
 from ._inference import MoonshineDynamic, MoonshineStatic
-from ...utils.logging import (
+from ...utils.log import (
     add_logging_args,
     configure_logging,
 )

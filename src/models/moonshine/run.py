@@ -13,7 +13,7 @@ from ...utils.demo import (
     add_common_args,
     format_answer,
 )
-from ...utils.logging import (
+from ...utils.log import (
     add_logging_args,
     configure_logging,
 )
