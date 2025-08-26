@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 from math import floor
 from pathlib import Path
@@ -24,6 +25,10 @@ from . import (
 )
 from ._graph import *
 from ._inference import MoonshineDynamic, MoonshineStatic
+from ...utils.logging import (
+    add_logging_args,
+    configure_logging,
+)
 from ...utils.onnx import (
     get_model_ops_count,
     print_onnx_model_inputs_outputs_info,
@@ -60,6 +65,7 @@ class MoonshineModelExporter:
         show_model_info: bool = False,
         use_optimum: bool = False,
     ):
+        self._logger = logging.getLogger(self.__class__.__name__)
         if model_size not in ["base", "tiny"]:
             raise ValueError(
                 f"Invalid model size '{model_size}', choose one of: ['base', 'tiny']"
@@ -106,8 +112,9 @@ class MoonshineModelExporter:
     @staticmethod
     def check_model(model: onnx.ModelProto, skip_data_prop: bool = False) -> onnx.ModelProto:
         if model.ir_version > 10:
-            print(
-                f"Warning: Model IR version is > 10 ({model.ir_version}), which might be unsupported by onnxruntime"
+            self._logger.warning(
+                "Warning: Model IR version is > 10 (%d), which might be unsupported by onnxruntime",
+                model.ir_version
             )
         model = onnx.shape_inference.infer_shapes(
             model, check_type=True, strict_mode=True, data_prop=not skip_data_prop
@@ -200,11 +207,15 @@ class MoonshineModelExporter:
         unmerged_model_names: set[str] = set(self.COMPONENTS.values())
         merged_model_names: set[str] = set(self.COMPONENTS_MERGED.values())
         model_names: set[str] = set(list(p.name for p in self._onnx_dir.glob("*.onnx")))
-        if model_names == unmerged_model_names:
-            print(f"[ONNX-load] Found encoder and un-merged decoder models @ '{self._onnx_dir}'")
+        if model_names == (merged_model_names | unmerged_model_names):
+            self._logger.warning("(ONNX-load) Found both merged and un-merged decoder models @ '%s', defaulting to loading un-merged", str(self._onnx_dir))
+            model_names = unmerged_model_names
+            merged_decoder = False
+        elif model_names == unmerged_model_names:
+            self._logger.info("(ONNX-load) Found encoder and un-merged decoder models @ '%s'", str(self._onnx_dir))
             merged_decoder = False
         elif model_names == merged_model_names:
-            print(f"[ONNX-load] Found encoder and merged decoder model @ '{self._onnx_dir}'")
+            self._logger.info("(ONNX-load) Found encoder and merged decoder model @ '%s'", str(self._onnx_dir))
             merged_decoder = True
         else:
             raise ValueError(
@@ -252,8 +263,11 @@ class MoonshineModelExporter:
                     raise ValueError(
                         f"Unexpected dynamic dimension '{d}' in tensor '{tensor.name}'"
                     )
-            print(
-                f"[encoder] Fixing IO dims '{tensor.name}': {old_shape} -> {tensor.shape}"
+            self._logger.info(
+                "(encoder) Fixing IO dims '%s': %s -> %s",
+                tensor.name,
+                str(old_shape),
+                str(tensor.shape)
             )
 
         graph.cleanup(
@@ -412,13 +426,13 @@ class MoonshineModelExporter:
         enc_seq_len_dims: list[str] = ["encoder_sequence_length", "floor(floor(floor(num_samples/64 - 127/64)/3)/2) - 1"],
     ):
         if self._merged_decoder:
-            print(f"[decoder_merged] Splitting merged decoder ...")
+            self._logger.info("(decoder_merged) Splitting merged decoder ...")
             decoder, decoder_with_past = self.split_merged_decoder(self._components["decoder_merged"])
             self._components["decoder"] = self.check_model(decoder)
             self._components["decoder_with_past"] = self.check_model(decoder_with_past)
             del self._components["decoder_merged"]
             assert set(self._components) == set(STATIC_MODEL_COMPONENTS)
-            print(f"[decoder_merged] Decoder split into regular and with_past models")
+            self._logger.info("(decoder_merged) Decoder split into regular and with_past models")
 
         self._components["encoder"] = self._make_encoder_model_static(
             batch_dim, inp_len_dim, enc_seq_len_dims
@@ -448,7 +462,6 @@ class MoonshineModelExporter:
         optimized_model = onnx.shape_inference.infer_shapes(
             optimized_model, check_type=True, strict_mode=True, data_prop=False
         )
-        self.check_model(onnx.load(model_path), skip_data_prop="decoder" in component and self._merged_decoder)
         onnx.save(optimized_model, model_path)
 
     def export_onnx(self, validate: bool = True):
@@ -457,13 +470,14 @@ class MoonshineModelExporter:
 
         for comp, model in self._components.items():
             self._export_paths[comp] = self._export_dir / f"{comp}.onnx"
-            print(f"[{comp}] Checking model...")
+            self._logger.info("(%s) Checking model...", comp)
             model = self.check_model(model, skip_data_prop="decoder" in comp and self._merged_decoder)
             onnx.save(model, self._export_paths[comp])
-            print(f"[{comp}] Optimizing model...")
+            self._logger.info("(%s) Optimizing model...", comp)
             self.optimize_model(self._export_paths[comp], comp)
+            self.check_model(onnx.load(self._export_paths[comp]), skip_data_prop="decoder" in comp and self._merged_decoder)
             if self._static_models:
-                print(f"[{comp}] Verifying static shapes...")
+                self._logger.info("(%s) Verifying static shapes...", comp)
                 dynamic_shapes = check_dynamic_shapes(onnx.load(self._export_paths[comp]))
                 if dynamic_shapes:
                     raise ValueError(
@@ -479,7 +493,7 @@ class MoonshineModelExporter:
                     ),
                     end="\n\n",
                 )
-            print(f"[{comp}] Saved model to '{self._export_paths[comp]}'")
+            self._logger.info("(%s) Saved model to '%s'", comp, str(self._export_paths[comp]))
 
         if validate:
             self.validate_onnx()
@@ -524,32 +538,37 @@ class MoonshineModelExporter:
         dataset = dataset.cast_column(
             "audio", Audio(processor.feature_extractor.sampling_rate)
         )
-        print(f"[ONNX-validation] loaded dataset 'hf-internal-testing/librispeech_asr_dummy', details: {dataset}")
+        self._logger.info("(ONNX-validation) Loaded dataset 'hf-internal-testing/librispeech_asr_dummy', details: %s", str(dataset))
 
         for i in range(n_iters):
             if i >= len(dataset):
-                print("[ONNX-validation] no more samples to validate, stopping")
+                self._logger.warning("(ONNX-validation) No more samples to validate, stopping")
                 break
 
             input = _sample_input(i)
             tokens = runner.run(input)
-            print(f"[ONNX-validation] (iter {i}, {runner.last_infer_time * 1000:.3f} ms): ", end="")
             val_tokens = val_runner.run(input)
             if not np.array_equal(tokens, val_tokens):
-                print(f"Warning: Validation failed, mismatched outputs\nExpected:\n{val_tokens},\nGenerated:\n{tokens}")
+                result = f"Warning: Validation failed, mismatched outputs\nExpected:\n{val_tokens},\nGenerated:\n{tokens}"
             else:
-                print(f"Validation successful, identical outputs")
+                result = f"Validation successful, identical outputs"
+            self._logger.info(
+                "(ONNX-validation) [iter %d, %.3f ms]: %s",
+                i,
+                runner.last_infer_time * 1000,
+                result
+            )
 
     def export_iree(self, iree_dir: str | os.PathLike):
         for comp, export_path in self._export_paths.items():
-            print(f"[IREE-export] Exporting {comp} model @ '{export_path}' to IREE...")
+            self._logger.info("(IREE-export) Exporting %s model @ '%s' to IREE...", comp, str(export_path))
             self.check_model(onnx.load(export_path), skip_data_prop="decoder" in comp and self._merged_decoder)
             iree_model_path = Path(iree_dir) / "moonshine" / self._model_size / self._model_dtype / ("static" if self._static_models else "dynamic")
             export_iree(
                 export_path,
                 iree_model_path
             )
-            print(f"[IREE-export] Successfully exported '{iree_model_path}/{export_path.stem}.vmfb'")
+            self._logger.info("(IREE-export) Successfully exported '%s/%s.vmfb'", str(iree_model_path), export_path.stem)
 
 
 if __name__ == "__main__":
@@ -599,8 +618,10 @@ if __name__ == "__main__":
         default=False,
         help="Skip exporting to IREE"
     )
+    add_logging_args(parser)
     args = parser.parse_args()
 
+    configure_logging(args.logging)
     exporter = MoonshineModelExporter(
         args.model_size,
         args.dtype,

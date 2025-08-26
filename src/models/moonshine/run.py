@@ -11,8 +11,11 @@ from tokenizers import Tokenizer
 from ._inference import MoonshineDynamic, MoonshineStatic
 from ...utils.demo import (
     add_common_args,
-    configure_logging,
     format_answer,
+)
+from ...utils.logging import (
+    add_logging_args,
+    configure_logging,
 )
 from ...inference.runners import IREEInferenceRunner
 
@@ -54,7 +57,7 @@ def _load_moonshine(
             decoder = m
         elif m.stem == "decoder_with_past":
             decoder_with_past = m
-    is_static = decoder is not None and decoder_with_past is not None
+    is_static = decoder_merged is None and decoder is not None and decoder_with_past is not None
     if not encoder:
         raise FileNotFoundError(
             f"Missing encoder model 'encoder.{kind}' @ '{model_dir}'"
@@ -156,10 +159,11 @@ if __name__ == "__main__":
         help="Maximum decoder length (required for static models)",
     )
     add_common_args(parser)
+    add_logging_args(parser)
     args = parser.parse_args()
 
     configure_logging(args.logging)
-    logger = logging.getLogger(__name__)
+    logger = logging.getLogger("Moonshine")
     logger.info("Starting demo...")
 
     main()
