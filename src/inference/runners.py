@@ -17,6 +17,10 @@ class InferenceRunner(ABC):
         self._infer_time_ms: float = 0.0
 
     @property
+    def model_path(self) -> str | os.PathLike:
+        return self._model_path
+
+    @property
     def infer_time_ms(self) -> float:
         return self._infer_time_ms
 

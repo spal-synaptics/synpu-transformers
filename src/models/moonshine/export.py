@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 from math import floor
 from pathlib import Path
@@ -24,6 +25,10 @@ from . import (
 )
 from ._graph import *
 from ._inference import MoonshineDynamic, MoonshineStatic
+from ...utils.log import (
+    add_logging_args,
+    configure_logging,
+)
 from ...utils.onnx import (
     get_model_ops_count,
     print_onnx_model_inputs_outputs_info,
@@ -58,8 +63,9 @@ class MoonshineModelExporter:
         max_tok_per_s: int = 6,
         models_dir: str | os.PathLike = "models/onnx",
         show_model_info: bool = False,
-        skip_optimum: bool = False,
+        use_optimum: bool = False,
     ):
+        self._logger = logging.getLogger(self.__class__.__name__)
         if model_size not in ["base", "tiny"]:
             raise ValueError(
                 f"Invalid model size '{model_size}', choose one of: ['base', 'tiny']"
@@ -78,7 +84,7 @@ class MoonshineModelExporter:
             floor(floor(floor(self._num_samples / 64 - 127 / 64) / 3) / 2) - 1
         )
 
-        if not skip_optimum:
+        if use_optimum or self._model_dtype in OPTIMUM_DTYPES:
             self._model_dtype = "fp32" if self._model_dtype == "float" else self._model_dtype
             if self._model_dtype not in OPTIMUM_DTYPES:
                 raise ValueError(f"'{self._model_dtype}' is an invalid dtype for optimium export, choose one of {OPTIMUM_DTYPES}")
@@ -99,15 +105,16 @@ class MoonshineModelExporter:
             / "export"
             / self._model_size
             / self._model_dtype
+            / ("static" if self._static_models else "dynamic")
         )
         self._export_dir.mkdir(parents=True, exist_ok=True)
         self._export_paths: dict[str, Path] = {}
 
-    @staticmethod
-    def check_model(model: onnx.ModelProto, skip_data_prop: bool = False) -> onnx.ModelProto:
+    def check_model(self, model: onnx.ModelProto, skip_data_prop: bool = False) -> onnx.ModelProto:
         if model.ir_version > 10:
-            print(
-                f"Warning: Model IR version is > 10 ({model.ir_version}), which might be unsupported by onnxruntime"
+            self._logger.warning(
+                "Warning: Model IR version is > 10 (%d), which might be unsupported by onnxruntime",
+                model.ir_version
             )
         model = onnx.shape_inference.infer_shapes(
             model, check_type=True, strict_mode=True, data_prop=not skip_data_prop
@@ -184,8 +191,6 @@ class MoonshineModelExporter:
                     f"Failed to export ONNX model via '{' '.join(e.cmd)}':\n    "
                     + "\n    ".join(e.output.strip().splitlines())
                 ) from None
-            for comp, comp_model_name in MoonshineModelExporter.COMPONENTS.items():
-                self.optimize_model(self._onnx_dir / comp_model_name, comp)
 
     def _hf_download_models(self):
         for comp_model_name in MoonshineModelExporter.COMPONENTS_MERGED.values():
@@ -200,11 +205,15 @@ class MoonshineModelExporter:
         unmerged_model_names: set[str] = set(self.COMPONENTS.values())
         merged_model_names: set[str] = set(self.COMPONENTS_MERGED.values())
         model_names: set[str] = set(list(p.name for p in self._onnx_dir.glob("*.onnx")))
-        if model_names == unmerged_model_names:
-            print(f"[ONNX-load] Found encoder and un-merged decoder models @ '{self._onnx_dir}'")
+        if model_names == (merged_model_names | unmerged_model_names):
+            self._logger.warning("(ONNX-load) Found both merged and un-merged decoder models @ '%s', defaulting to loading merged", str(self._onnx_dir))
+            model_names = merged_model_names
+            merged_decoder = True
+        elif model_names == unmerged_model_names:
+            self._logger.info("(ONNX-load) Found encoder and un-merged decoder models @ '%s'", str(self._onnx_dir))
             merged_decoder = False
         elif model_names == merged_model_names:
-            print(f"[ONNX-load] Found encoder and merged decoder model @ '{self._onnx_dir}'")
+            self._logger.info("(ONNX-load) Found encoder and merged decoder model @ '%s'", str(self._onnx_dir))
             merged_decoder = True
         else:
             raise ValueError(
@@ -252,8 +261,11 @@ class MoonshineModelExporter:
                     raise ValueError(
                         f"Unexpected dynamic dimension '{d}' in tensor '{tensor.name}'"
                     )
-            print(
-                f"[encoder] Fixing IO dims '{tensor.name}': {old_shape} -> {tensor.shape}"
+            self._logger.info(
+                "(encoder) Fixing IO dims '%s': %s -> %s",
+                tensor.name,
+                str(old_shape),
+                str(tensor.shape)
             )
 
         graph.cleanup(
@@ -309,33 +321,20 @@ class MoonshineModelExporter:
                     raise ValueError(
                         f"Unexpected dynamic dimension '{d}' in tensor '{tensor.name}'"
                     )
-            print(
-                f"[{comp}] Fixing IO dims '{tensor.name}': {old_shape} -> {tensor.shape}"
+            self._logger.info(
+                "(%s) Fixing IO dims '%s': %s -> %s",
+                comp,
+                tensor.name,
+                str(old_shape),
+                str(tensor.shape)
             )
 
-        for node in graph.nodes:
+        # Remove isNaN ops
+        graph = remove_isNaN(comp, graph)
+        # Move model output if it's fed by a Concat node which has a Pad consumer
+        if not with_past:
+            graph = move_output_from_concat(comp, graph, output_names=output_names, pad_len=pad_len)
 
-            # Remove or replace isNaN ops
-            if node.op == "IsNaN":
-                graph.remove_is_NaN(node)
-                print(f"[{comp}] Removed unsupported IsNaN op '{node.name}'")
-
-            # Move model output if it's fed by a Concat node which has a Pad consumer
-            if (
-                not with_past
-                and node.op == "Concat"
-                and node.outputs[0].name in output_names
-            ):
-                output_name = node.outputs[0].name
-                consumers: list[gs.Node] = list(node.outputs[0].outputs)
-                for consumer in consumers:
-                    if consumer.op == "Pad":
-                        graph.move_output_from_concat_to_slice(node, consumer, pad_len)
-                        print(
-                            f"[{comp}] Moved output '{output_name}' to Pad node '{consumer.name}'"
-                        )
-
-        # TODO: Add Cast nodes before activation ops
         if with_past:
             cur_len_2d = gs.Variable("current_len", dtype=np.int64, shape=[1, 1])
             graph.inputs.append(cur_len_2d)
@@ -343,57 +342,17 @@ class MoonshineModelExporter:
                 name="current_len_to_1d",
                 op="Squeeze",
                 inputs=[cur_len_2d, [0]],
-                outputs=[
-                    gs.Variable(
-                        cur_len_2d.name + "_squeezed", dtype=np.int64, shape=[1]
-                    )
-                ],
+                outputs=[gs.Variable(cur_len_2d.name + "_squeezed", dtype=np.int64, shape=[1])],
             )[0]
 
-            for node in graph.nodes:
-
-                # Replace dynamic KV cache update
-                if node.op == "Concat" and node.outputs[0].name in output_names:
-                    cache_output = node.outputs[0].name
-                    if node.attrs["axis"] != -2:
-                        raise ValueError(
-                            f"Static KV Cache: '{node.name}' expected Concat axis to be -2, got {node.attrs['axis']}"
-                        )
-                    if len(node.inputs) != 2:
-                        raise ValueError(
-                            f"Static KV Cache: '{node.name}' expected Concat node to have 2 inputs, got {len(node.inputs)}"
-                        )
-                    graph.replace_kv_concat_with_mask(node, cur_len, self._max_tokens)
-                    print(f"[{comp}] Added static KV cache for output '{cache_output}'")
-
-                # Add causal attention score mask
-                if node.op == "Softmax" and node.name.endswith("self_attn/Softmax"):
-                    if (prod := node.i()).op != "Add":
-                        raise ValueError(
-                            f"Causal Attention Mask: '{node.name}' expected producer to be Add node, got {prod.op} ({prod.name})"
-                        )
-                    graph.add_causal_attn_score_mask(prod, cur_len, self._max_tokens)
-                    print(
-                        f"[{comp}] Added causal attention mask to scores at node '{node.name}'"
-                    )
-
-                # Replace dynamic sequence length getter with `cur_len`
-                if node.op == "Shape" and "past_key_values" in node.inputs[0].name:
-                    graph.replace_dynamic_seq_len_getter(node, cur_len)
-                    print(
-                        f"[{comp}] Replaced dynamic seq len getter at node '{node.name}'"
-                    )
-
-                # Replace dynamic index computation `Range(start, start + 1, 1) -> index`
-                if (
-                    node.op == "Range"
-                    and node.i(1).op == "Add"
-                    and any(inp is node.inputs[0] for inp in node.i(1).inputs)
-                ):
-                    graph.replace_dynamic_range_index(node)
-                    print(
-                        f"[{comp}] Replaced dynamic range index for node '{node.name}'"
-                    )
+            # Replace dynamic KV cache
+            graph = replace_dynamic_kv_cache(comp, graph, cur_len=cur_len, output_names=output_names, max_tokens=self._max_tokens)
+            # Add causal attention score mask
+            graph = mask_future_attn_scores(comp, graph, cur_len=cur_len, max_tokens=self._max_tokens)
+            # Replace dynamic sequence length getter with `cur_len`
+            graph = add_curr_len_input(comp, graph, cur_len=cur_len)
+            # Replace dynamic index computation `Range(start, start + 1, 1) -> index`
+            graph = convert_to_static_index(comp, graph)
 
         graph = graph.cleanup(
             remove_unused_graph_inputs=True, remove_unused_node_outputs=True
@@ -404,6 +363,29 @@ class MoonshineModelExporter:
         new_model.ir_version = decoder_model.ir_version
         return new_model
 
+    def _patch_projections_dequantize(self):
+        if self._model_dtype in ("float", "fp32"):
+            return
+
+        # Manually dequantize projection scores
+        for comp, model in self._components.items():
+            if "decoder" not in comp:
+                continue
+            graph = gs.import_onnx(model)
+            graph = dequantize_proj_matmul(
+                comp, graph,
+                hidden_size=int(self._config.hidden_size),
+                vocab_size=int(self._config.vocab_size)
+            )
+            graph = graph.cleanup(
+                remove_unused_graph_inputs=True, remove_unused_node_outputs=True
+            ).toposort()
+            new_model = onnx.shape_inference.infer_shapes(
+                gs.export_onnx(graph), check_type=True, strict_mode=True, data_prop=False
+            )
+            new_model.ir_version = model.ir_version
+            self._components[comp] = new_model
+
     def make_static(
         self,
         *,
@@ -412,13 +394,13 @@ class MoonshineModelExporter:
         enc_seq_len_dims: list[str] = ["encoder_sequence_length", "floor(floor(floor(num_samples/64 - 127/64)/3)/2) - 1"],
     ):
         if self._merged_decoder:
-            print(f"[decoder_merged] Splitting merged decoder ...")
+            self._logger.info("(decoder_merged) Splitting merged decoder ...")
             decoder, decoder_with_past = self.split_merged_decoder(self._components["decoder_merged"])
             self._components["decoder"] = self.check_model(decoder)
             self._components["decoder_with_past"] = self.check_model(decoder_with_past)
             del self._components["decoder_merged"]
             assert set(self._components) == set(STATIC_MODEL_COMPONENTS)
-            print(f"[decoder_merged] Decoder split into regular and with_past models")
+            self._logger.info("(decoder_merged) Decoder split into regular and with_past models")
 
         self._components["encoder"] = self._make_encoder_model_static(
             batch_dim, inp_len_dim, enc_seq_len_dims
@@ -448,22 +430,23 @@ class MoonshineModelExporter:
         optimized_model = onnx.shape_inference.infer_shapes(
             optimized_model, check_type=True, strict_mode=True, data_prop=False
         )
-        self.check_model(onnx.load(model_path), skip_data_prop="decoder" in component and self._merged_decoder)
         onnx.save(optimized_model, model_path)
 
     def export_onnx(self, validate: bool = True):
         if self._static_models:
             self.make_static()
+        self._patch_projections_dequantize()
 
         for comp, model in self._components.items():
             self._export_paths[comp] = self._export_dir / f"{comp}.onnx"
-            print(f"[{comp}] Checking model...")
+            self._logger.info("(%s) Checking model...", comp)
             model = self.check_model(model, skip_data_prop="decoder" in comp and self._merged_decoder)
             onnx.save(model, self._export_paths[comp])
-            print(f"[{comp}] Optimizing model...")
+            self._logger.info("(%s) Optimizing model...", comp)
             self.optimize_model(self._export_paths[comp], comp)
+            self.check_model(onnx.load(self._export_paths[comp]), skip_data_prop="decoder" in comp and self._merged_decoder)
             if self._static_models:
-                print(f"[{comp}] Verifying static shapes...")
+                self._logger.info("(%s) Verifying static shapes...", comp)
                 dynamic_shapes = check_dynamic_shapes(onnx.load(self._export_paths[comp]))
                 if dynamic_shapes:
                     raise ValueError(
@@ -479,7 +462,7 @@ class MoonshineModelExporter:
                     ),
                     end="\n\n",
                 )
-            print(f"[{comp}] Saved model to '{self._export_paths[comp]}'")
+            self._logger.info("(%s) Saved model to '%s'", comp, str(self._export_paths[comp]))
 
         if validate:
             self.validate_onnx()
@@ -524,32 +507,37 @@ class MoonshineModelExporter:
         dataset = dataset.cast_column(
             "audio", Audio(processor.feature_extractor.sampling_rate)
         )
-        print(f"[ONNX-validation] loaded dataset 'hf-internal-testing/librispeech_asr_dummy', details: {dataset}")
+        self._logger.info("(ONNX-validation) Loaded dataset 'hf-internal-testing/librispeech_asr_dummy', details: %s", str(dataset))
 
         for i in range(n_iters):
             if i >= len(dataset):
-                print("[ONNX-validation] no more samples to validate, stopping")
+                self._logger.warning("(ONNX-validation) No more samples to validate, stopping")
                 break
 
             input = _sample_input(i)
             tokens = runner.run(input)
-            print(f"[ONNX-validation] (iter {i}, {runner.last_infer_time * 1000:.3f} ms): ", end="")
             val_tokens = val_runner.run(input)
             if not np.array_equal(tokens, val_tokens):
-                print(f"Warning: Validation failed, mismatched outputs\nExpected:\n{val_tokens},\nGenerated:\n{tokens}")
+                result = f"Warning: Validation failed, mismatched outputs\nExpected:\n{val_tokens},\nGenerated:\n{tokens}"
             else:
-                print(f"Validation successful, identical outputs")
+                result = f"Validation successful, identical outputs"
+            self._logger.info(
+                "(ONNX-validation) [iter %d, %.3f ms]: %s",
+                i,
+                runner.last_infer_time * 1000,
+                result
+            )
 
     def export_iree(self, iree_dir: str | os.PathLike):
         for comp, export_path in self._export_paths.items():
-            print(f"[IREE-export] Exporting {comp} model @ '{export_path}' to IREE...")
+            self._logger.info("(IREE-export) Exporting %s model @ '%s' to IREE...", comp, str(export_path))
             self.check_model(onnx.load(export_path), skip_data_prop="decoder" in comp and self._merged_decoder)
-            iree_model_path = Path(iree_dir) / "moonshine" / self._model_size / self._model_dtype
+            iree_model_path = Path(iree_dir) / "moonshine" / self._model_size / self._model_dtype / ("static" if self._static_models else "dynamic")
             export_iree(
                 export_path,
                 iree_model_path
             )
-            print(f"[IREE-export] Successfully exported '{iree_model_path}/{export_path.stem}.vmfb'")
+            self._logger.info("(IREE-export) Successfully exported '%s/%s.vmfb'", str(iree_model_path), export_path.stem)
 
 
 if __name__ == "__main__":
@@ -588,10 +576,10 @@ if __name__ == "__main__":
         help="Export dynamic models for CPU"
     )
     parser.add_argument(
-        "--skip-optimum",
+        "--use-optimum",
         action="store_true",
         default=False,
-        help="Use pre-exported ONNX models instead of exporting with optimum-cli"
+        help="Use optimum-cli to generate ONNX models rather than loading prebuilt ones"
     )
     parser.add_argument(
         "--skip-iree",
@@ -599,8 +587,10 @@ if __name__ == "__main__":
         default=False,
         help="Skip exporting to IREE"
     )
+    add_logging_args(parser)
     args = parser.parse_args()
 
+    configure_logging(args.logging)
     exporter = MoonshineModelExporter(
         args.model_size,
         args.dtype,
@@ -609,7 +599,7 @@ if __name__ == "__main__":
         max_tok_per_s=args.tokens_per_sec,
         models_dir=args.onnx_dir,
         show_model_info=args.show_model_info,
-        skip_optimum=args.skip_optimum
+        use_optimum=args.use_optimum
     )
     exporter.export_onnx()
     if not args.skip_iree:

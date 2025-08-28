@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 from abc import ABC, abstractmethod
@@ -21,6 +22,7 @@ class MoonshineBase(ABC):
         model_size: Literal["base", "tiny"],
         max_inp_len: int | None
     ):
+        self._logger = logging.getLogger(self.__class__.__name__)
         self._model_size = model_size
         self._max_inp_len = max_inp_len
 
@@ -67,10 +69,10 @@ class MoonshineBase(ABC):
     def _size_input(self, input: np.ndarray) -> np.ndarray:
         input = input.flatten()
         if len(input) > self._max_inp_len:
-            # print(f"Truncating input from {len(input)} to {self.max_inp_len}")
+            self._logger.warning("Truncating input from %d to %d", len(input), self.max_inp_len)
             input = input[: self._max_inp_len]
         elif len(input) < self._max_inp_len:
-            # print(f"Padding input from {len(input)} to {self.max_inp_len}")
+            self._logger.info("Padding input from %d to %d", len(input), self.max_inp_len)
             input = np.pad(
                 input,
                 (0, self._max_inp_len - len(input)),
@@ -94,7 +96,9 @@ class MoonshineDynamic(MoonshineBase):
         super().__init__(model_size, max_inp_len)
 
         self._encoder = encoder
+        self._logger.info("Loaded encoder '%s'", str(self._encoder.model_path))
         self._decoder = decoder
+        self._logger.info("Loaded merged decoder '%s'", str(self._decoder.model_path))
 
     @classmethod
     def from_onnx(
@@ -134,12 +138,12 @@ class MoonshineDynamic(MoonshineBase):
     def _run_decoder(
         self, input_tokens: list[int], encoder_out: np.ndarray, *, seq_len: int
     ) -> tuple[int, list[np.ndarray]]:
-        input_ids = [input_tokens]
+        input_ids = np.array([input_tokens], dtype=np.int64)
         decoder_inputs = {
             "input_ids": input_ids,
             "encoder_hidden_states": encoder_out,
-            "use_cache_branch": [seq_len > 0],
             **self._kv_cache,
+            "use_cache_branch": np.array([seq_len > 0], dtype=np.bool),
         }
         logits, *cache = self._decoder.infer(decoder_inputs)
         next_token = logits[0, -1].argmax().item()
@@ -149,7 +153,7 @@ class MoonshineDynamic(MoonshineBase):
         self,
         input: np.ndarray,
         max_tokens: int | None = None,
-    ):
+    ) -> np.ndarray:
         self._n_tokens_gen = 0
         if max_tokens is None:
             max_tokens = int((input.shape[-1] / 16000) * 6)
@@ -159,7 +163,7 @@ class MoonshineDynamic(MoonshineBase):
         st = time.time()
         next_token = self._start_token_id
         tokens = [next_token]
-        encoder_out = self._encoder.infer({"input_values": input})[0]
+        encoder_out = self._encoder.infer({"input_values": input})[0].astype(np.float32)
 
         for i in range(max_tokens):
             next_token, cache = self._run_decoder([next_token], encoder_out, seq_len=i)
@@ -188,9 +192,11 @@ class MoonshineStatic(MoonshineBase):
         super().__init__(model_size, max_inp_len)
 
         self._encoder = encoder
+        self._logger.info("Loaded encoder '%s'", str(self._encoder.model_path))
         self._decoder = decoder
+        self._logger.info("Loaded decoder '%s'", str(self._decoder.model_path))
         self._decoder_with_past = decoder_with_past
-        self._model_size = model_size
+        self._logger.info("Loaded decoder with past '%s'", str(self._decoder_with_past.model_path))
         self._max_dec_len = max_dec_len
         self._dec_cache_shapes: dict[str, tuple[int]] = {
             cache_name: (1, self._n_kv_heads, self._max_dec_len, self._head_dim)
@@ -282,7 +288,7 @@ class MoonshineStatic(MoonshineBase):
     def _run_decoder(
         self, input_tokens: list[int], encoder_out: np.ndarray, *, seq_len: int
     ) -> tuple[int, list[np.ndarray]]:
-        input_ids = [input_tokens]
+        input_ids = np.array([input_tokens], dtype=np.int64)
         if seq_len == 0:
             decoder_inputs = {
                 "input_ids": input_ids,
@@ -292,8 +298,8 @@ class MoonshineStatic(MoonshineBase):
         else:
             decoder_inputs = {
                 "input_ids": input_ids,
-                "current_len": np.array([[seq_len]], dtype=np.int64),
                 **self._kv_cache,
+                "current_len": np.array([[seq_len]], dtype=np.int64),
             }
             logits, *cache = self._decoder_with_past.infer(decoder_inputs)
         next_token = logits[0, -1].argmax().item()
@@ -315,7 +321,7 @@ class MoonshineStatic(MoonshineBase):
         next_token = self._start_token_id
         tokens = [next_token]
         input = self._size_input(input)
-        encoder_out = self._encoder.infer({"input_values": input})[0]
+        encoder_out = self._encoder.infer({"input_values": input})[0].astype(np.float32)
 
         next_token, init_cache = self._run_decoder(tokens, encoder_out, seq_len=0)
         self._update_cache(init_cache, update_all=True)

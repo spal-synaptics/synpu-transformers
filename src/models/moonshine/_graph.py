@@ -1,10 +1,269 @@
+import logging
+from functools import wraps, WRAPPER_ASSIGNMENTS
+from typing import ParamSpec, Callable, Concatenate
+
 import onnx
 import onnx_graphsurgeon as gs
 import numpy as np
 
 
+logger = logging.getLogger("MoonshineGraphEditor")
+P = ParamSpec("P")
+ASSIGNED = tuple(x for x in WRAPPER_ASSIGNMENTS if x != "__annotations__")
+
+def graph_edit(edit_fn: Callable[Concatenate[gs.Graph, gs.Node, P], object]):
+    @wraps(edit_fn, assigned=ASSIGNED)
+    def run(component: str, graph: gs.Graph, **kwargs: P.kwargs) -> gs.Graph:
+        for node in list(graph.nodes):
+            edit_fn(component, graph, node, **kwargs)
+        return graph.cleanup(
+            remove_unused_graph_inputs=True,
+            remove_unused_node_outputs=True
+        ).toposort()
+    return run
+
+
+@graph_edit
+def dequantize_proj_matmul(
+    component: str,
+    graph: gs.Graph,
+    node: gs.Node,
+    *,
+    hidden_size: int,
+    vocab_size: int
+):
+    """
+    Manually dequantize projection scores MatMul producer to prevent MLIR warnings.
+
+    Args
+        component (str): Component name for logging
+        graph (gs.Graph): ONNX graph
+        node (gs.Node): Projection scores producer MatMul node
+    """
+    if node.op == "MatMul" and node.outputs[0].name == "logits":
+        dequant_node: gs.Node = node.i(1)
+        transpose_node: gs.Node = dequant_node.i()
+        graph.fold_proj_dq(
+            node,
+            dequant_node,
+            transpose_node,
+            hidden_size,
+            vocab_size
+        )
+        logger.info("(%s) Dequantized projection scores producer", component)
+
+
+@graph_edit
+def remove_isNaN(
+    component: str,
+    graph: gs.Graph,
+    node: gs.Node
+):
+    """
+    Remove IsNaN operations that are not supported by the target platform.
+    
+    Args:
+        component (str): Component name for logging
+        graph (gs.Graph): ONNX graph
+        node (gs.Node): Node to potentially remove
+    """
+    if node.op == "IsNaN":
+        graph.remove_unsupported_isNaN(node)
+        logger.info("[%s] Removed unsupported IsNaN op '%s'", component, node.name)
+
+
+@graph_edit
+def move_output_from_concat(
+    component: str,
+    graph: gs.Graph,
+    node: gs.Node,
+    *,
+    output_names: list[str],
+    pad_len: str
+):
+    """
+    Move outputs from Concat nodes to their consumer Pad nodes for compatibility.
+
+    Args:
+        component (str): Component name for logging
+        graph (gs.Graph): ONNX graph
+        node (gs.Node): Node to potentially modify
+        output_names (list[str]): List of output names to process
+        pad_len (str): Length of padding to apply
+    """
+    if node.op == "Concat" and node.outputs[0].name in output_names:
+        output_name = node.outputs[0].name
+        consumers: list[gs.Node] = list(node.outputs[0].outputs)
+        for consumer in consumers:
+            if consumer.op == "Pad":
+                graph.move_output_from_concat_to_slice(node, consumer, pad_len)
+                logger.info("[%s] Moved output '%s' to Pad node '%s'", component, output_name, consumer.name)
+
+
+@graph_edit
+def replace_dynamic_kv_cache(
+    component: str,
+    graph: gs.Graph,
+    node: gs.Node,
+    *,
+    output_names: list[str],
+    cur_len: gs.Variable,
+    max_tokens: int
+):
+    """
+    Replace dynamic key-value cache updates with static in-place operations.
+
+    Args:
+        component (str): Component name for logging
+        graph (gs.Graph): ONNX graph
+        node (gs.Node): Node to potentially modify
+        output_names (list[str]): List of cache output names to process
+        cur_len (gs.Variable): Current sequence length input
+        max_tokens (int): Maximum number of tokens in sequence
+    """
+    if node.op == "Concat" and node.outputs[0].name in output_names:
+        cache_output = node.outputs[0].name
+        if node.attrs["axis"] != -2:
+            raise ValueError(
+                f"Static KV Cache: '{node.name}' expected Concat axis to be -2, got {node.attrs['axis']}"
+            )
+        if len(node.inputs) != 2:
+            raise ValueError(
+                f"Static KV Cache: '{node.name}' expected Concat node to have 2 inputs, got {len(node.inputs)}"
+            )
+        graph.replace_kv_concat_with_mask(node, cur_len, max_tokens)
+        logger.info("[%s] Added static KV cache for output '%s'", component, cache_output)
+
+
+@graph_edit
+def mask_future_attn_scores(
+    component: str,
+    graph: gs.Graph,
+    node: gs.Node,
+    *,
+    cur_len: gs.Variable,
+    max_tokens: int
+):
+    """
+    Add causal masking to attention scores to prevent attending to future tokens.
+
+    Args:
+        component (str): Component name for logging
+        graph (gs.Graph): ONNX graph
+        node (gs.Node): Node to potentially modify
+        cur_len (gs.Variable): Current sequence length input
+        max_tokens (int): Maximum number of tokens in sequence
+    """
+    if node.op == "Softmax" and node.name.endswith("self_attn/Softmax"):
+        if (prod := node.i()).op != "Add":
+            raise ValueError(
+                f"Causal Attention Mask: '{node.name}' expected producer to be Add node, got {prod.op} ({prod.name})"
+            )
+        graph.add_causal_attn_score_mask(prod, cur_len, max_tokens)
+        logger.info("[%s] Added causal attention mask to scores at node '%s'", component, node.name)
+
+
+@graph_edit
+def add_curr_len_input(
+    component: str,
+    graph: gs.Graph,
+    node: gs.Node,
+    *,
+    cur_len: gs.Variable
+):
+    """
+    Replace dynamic sequence length computation with runtime model input.
+
+    Args:
+        component (str): Component name for logging
+        graph (gs.Graph): ONNX graph
+        node (gs.Node): Node to potentially modify
+        cur_len (gs.Variable): Current sequence length input
+    """
+    if node.op == "Shape" and "past_key_values" in node.inputs[0].name:
+        graph.replace_dynamic_seq_len_getter(node, cur_len)
+        logger.info("[%s] Replaced dynamic seq len getter at node '%s'", component, node.name)
+
+
+@graph_edit
+def convert_to_static_index(
+    component: str,
+    graph: gs.Graph,
+    node: gs.Node
+):
+    """
+    Convert dynamic Range-based indexing to static indexing if `index = Range(start, start + 1, 1)`.
+
+    Args:
+        component (str): Component name for logging
+        graph (gs.Graph): ONNX graph
+        node (gs.Node): Node to potentially modify
+    """
+    if (
+        node.op == "Range"
+        and node.i(1).op == "Add"
+        and any(inp is node.inputs[0] for inp in node.i(1).inputs)
+    ):
+        graph.replace_dynamic_range_index(node)
+        logger.info("[%s] Replaced dynamic range index for node '%s'", component, node.name)
+
+
+# ----------------------------- Graph edit functions --------------------------------- #
+
+
 @gs.Graph.register()
-def remove_is_NaN(self: gs.Graph, is_nan_node: gs.Node) -> None:
+def fold_proj_dq(
+    self: gs.Graph,
+    proj_matmul_node: gs.Node,
+    dequant_node: gs.Node,
+    transpose_node: gs.Node,
+    hidden_size: int,
+    vocab_size: int
+) -> None:
+    if proj_matmul_node.op != "MatMul":
+        raise ValueError(
+            f"Expected MatMul node, got {proj_matmul_node.op} for projection scores dequantize folding"
+        )
+    # dq_node: gs.Node = proj_matmul_node.i(1)
+    if dequant_node.op != "DequantizeLinear":
+        raise ValueError(
+            f"Expected Dequantize node, got {dequant_node.op} for projection scores dequantize folding"
+        )
+    # transpose_node: gs.Node = dq_node.i()
+    if transpose_node.op != "Transpose":
+        raise ValueError(
+            f"Expected Transpose node, got {transpose_node.op} for projection scores dequantize folding"
+        )
+
+    if not isinstance(transpose_node.inputs[0], gs.Constant):
+        raise ValueError(f"Expected constant input for transpose node, got {type(transpose_node.inputs[0])}")
+    W_q: np.ndarray = transpose_node.inputs[0].values
+    if W_q.shape != (vocab_size, hidden_size):
+        raise ValueError(f"Expected weight shape of {(vocab_size, hidden_size)}, got {W_q.shape}")
+    if W_q.dtype != np.uint8:
+        raise ValueError(f"Expected uint8 weights, got {W_q.dtype}")
+    W_q = W_q.T     # transpose manually
+
+    if len(dequant_node.inputs) < 3:
+        raise ValueError(f"Expected 3 inputs (x, scale, zp) for DequantizeLinear node, got {len(dequant_node.inputs)}")
+    scale_inp, zp_inp = dequant_node.inputs[1], dequant_node.inputs[2]
+    if not isinstance(scale_inp, gs.Constant):
+        raise ValueError(f"Expected constant scale, got {type(scale_inp)}")
+    if not isinstance(zp_inp, gs.Constant):
+        raise ValueError(f"Expected constant zp, got {type(scale_inp)}")
+    scale = scale_inp.values.item()
+    zp = zp_inp.values.item()
+    proj_matmul_node.inputs[1] = gs.Constant(
+        proj_matmul_node.inputs[1].name + "_fp32_folded",
+        (W_q.astype(np.int32) - np.int32(zp)).astype(np.float32) * np.float32(scale)
+    )
+    
+    dequant_node.outputs.clear()
+    transpose_node.outputs.clear()
+
+
+@gs.Graph.register()
+def remove_unsupported_isNaN(self: gs.Graph, is_nan_node: gs.Node) -> None:
     """
     Remove unsupported `IsNaN -> Where` operation.
 
